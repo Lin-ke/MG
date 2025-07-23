@@ -1,0 +1,80 @@
+#include "/Engine/Private/Common.ush"
+
+struct Frustum
+{
+	float4 planes[6];
+};
+
+float4 LeftPlane;
+float4 RightPlane;
+float4 TopPlane;
+float4 BottomPlane;
+float4 NearPlane;
+
+// screen texture
+Texture2D<float> SCREEN_DEPTH_TEXTURE;
+
+Frustum GetTileFrustum(uint2 tile_id, uint2 TILE_SIZE)
+{
+	float2 min_uv = float2(tile_id) / float2(TILE_SIZE);
+	float2 max_uv = float2((tile_id + uint2(1, 1))) / float2(TILE_SIZE);
+	Frustum frustum;
+	frustum.planes[0] = lerp(LeftPlane,RightPlane,min_uv.xxxx); // left
+	frustum.planes[1] = lerp(LeftPlane, RightPlane, max_uv.xxxx); // right
+	frustum.planes[2] = lerp(-TopPlane,-BottomPlane,min_uv.yyyy); // btm
+	frustum.planes[3] = lerp(-TopPlane,-BottomPlane,max_uv.yyyy); // top
+	frustum.planes[1] *= -1.0f;
+	frustum.planes[3] *= -1.0f;
+	
+	frustum.planes[4] = NearPlane;										
+
+
+// we dont need far plane
+	return frustum;
+}
+
+bool FrustumIntersectSphere(Frustum frustum, float4 sphere)
+{
+	UNROLL
+	for (int i = 0; i < 5; i++)
+	{
+		float signedDistanceFromPlane = dot(frustum.planes[i], float4(sphere.xyz, -1.0f));
+		if (signedDistanceFromPlane > sphere.w)
+			return false;
+	}
+
+	return true;
+}
+
+
+
+int2 GetTile(float2 uv)
+{
+	int2 tile = floor(uv * TILE_SIZE);
+	return tile;
+}
+
+
+float3 GetViewSpacePositionFromScreenUVAndCameraDepth(float2 uv)
+{
+	float depth = SCREEN_DEPTH_TEXTURE.SampleLevel(GlobalBilinearClampedSampler, uv, 0.0f);
+	uv.y = 1.0f - uv.y; 
+    
+	float2 ndc = uv * 2.0 - 1.0;
+	float4 clipPos = float4(ndc, depth, 1.0);
+	float4 viewPos = mul(clipPos, View.ClipToView);
+	viewPos.xyz /= viewPos.w;
+    
+	return viewPos.xyz;
+}
+
+float3 GetViewSpacePositionFromScreenUV(float2 uv, float depth)
+{
+	uv.y = 1.0f - uv.y; // flip 
+	float2 ndc = uv * 2.0 - 1.0;
+	float4 clipPos = float4(ndc, depth, 1.0);
+	float4 viewPos = mul(clipPos, View.ClipToView);
+	viewPos.xyz /= viewPos.w;
+    
+	return viewPos.xyz;
+}

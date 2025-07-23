@@ -1,0 +1,9 @@
+﻿#include "/Engine/Private/Common.ush"
+
+void MainPS(
+	in float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0
+)
+{
+	OutColor = float4(1, 1, 1, 1);
+}

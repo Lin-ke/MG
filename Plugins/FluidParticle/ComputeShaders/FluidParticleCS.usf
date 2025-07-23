@@ -1,0 +1,269 @@
+// Include this
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "helper.ush"
+uint2 WINDOW_SIZE;
+uint2 HALF_WINDOW_SIZE;
+uint2 TILE_SIZE;
+#define MAX_FLUID_PARTICLE_PER_TILE 2048
+#define MAX_FLUID_PARTICLE_PER_CHUNK 1024 /// 这里要和c++一致
+/// 规定每个chunk的大小 
+
+// gbuffer
+RWTexture2D<float4> RW_COLOR_TEXTURE;
+RWTexture2D<float4> RW_NORMAL_TEXTURE;
+RWTexture2D<float4> RW_VELOCITY_TEXTURE;
+RWTexture2D<float> RW_DEPTH_TEXTURE;
+
+/// data.
+struct FluidParticleInfo
+{
+	float3 position;
+	float3 velocity;
+	float3 color;
+	float radius;
+	// float opacity;   // TODO
+};
+/// Sphere: float4 (center + radius)
+
+RWStructuredBuffer<FluidParticleInfo> PARTICLE_INFO_BUFFER;
+
+uint PARTICLE_INFO_SIZE;
+float SMOOTH_RATE;
+float RADIUS_OFFSET;
+float2 CAMERA_PLANE; // near and far plane
+
+struct FluidParticlesComputeData
+{
+	uint tileMappingIndex;
+	uint chunkMappingIndex;
+};
+/// Make tile particle list
+RWTexture2D<uint2> RW_TILE_TEXTURE; /// 
+RWBuffer<uint> TILE_MAPPING_BUFFER;
+
+RWStructuredBuffer<FluidParticlesComputeData> COMPUTE_DATA_BUFFER; // 一个中间变量，记录加法用。
+
+
+
+groupshared float4 SHARED_BOUNDING_SPHERE[64]; // use group shared memory
+
+/// SDF Bake
+float3 SDF_WORLD_POS;
+float3 SDF_SCALE;
+int3 SDF_SIZE;
+uint3 CHUNK_SIZE;
+
+struct BoundingBox
+{
+	float3 minBound;
+	float3 maxBound;
+};
+RWBuffer<uint> CHUNK_MAPPING_BUFFER;
+RWTexture3D<float> RW_SDF_TEXTURE;
+
+
+/// ray march
+uint RAY_MARCH_METHORD;
+float4x4 CAMERA_INV_VIEW; /// view -> world
+
+[numthreads(16, 16, 1)]
+void DispatchCS(uint3 DispatchThreadID : SV_DispatchThreadID, uint3 GroupThreadID : SV_GroupThreadID)
+{
+	
+}
+
+[numthreads(8, 8, 1)]
+void DepthCulling(uint3 DispatchThreadID : SV_DispatchThreadID, uint3 GroupThreadID : SV_GroupThreadID)
+{
+	float2 uv = float2(DispatchThreadID.xy + 0.5f) / HALF_WINDOW_SIZE.xy;
+	float particleDepth = RW_DEPTH_TEXTURE[DispatchThreadID.xy].x;
+	float screenDepth = SCREEN_DEPTH_TEXTURE.SampleLevel(GetGlobalSampler(Bilinear, Clamped), uv, 0.0f).x;
+	if (particleDepth <= screenDepth)
+		RW_COLOR_TEXTURE[DispatchThreadID.xy] = 0.0f;
+}
+
+float SDFDistance(float3 worldPos, uint2 mapping)
+{
+	float softDistance = 10;
+	for (int j = 0; j < mapping.y; j++)
+	{
+		uint particleID = TILE_MAPPING_BUFFER[mapping.x + j];
+		FluidParticleInfo particleInfo = PARTICLE_INFO_BUFFER[particleID];
+        
+		float newDistance = length(worldPos.xyz - particleInfo.position) - particleInfo.radius;
+        
+		softDistance = SoftMin(softDistance, newDistance, SMOOTH_RATE);
+	}
+    
+	return softDistance;
+}
+
+
+float SDFDistance(float3 worldPos)
+{
+	float3 sdfMinbound = SDF_WORLD_POS - 0.5f * SDF_SCALE;
+	float3 sdfMaxbound = SDF_WORLD_POS + 0.5f * SDF_SCALE;
+    
+	float3 clampedWorldPos;
+	clampedWorldPos.x = clamp(worldPos.x, sdfMinbound.x, sdfMaxbound.x);
+	clampedWorldPos.y = clamp(worldPos.y, sdfMinbound.y, sdfMaxbound.y);
+	clampedWorldPos.z = clamp(worldPos.z, sdfMinbound.z, sdfMaxbound.z);
+    
+	if (clampedWorldPos.x != worldPos.x ||
+		clampedWorldPos.y != worldPos.y ||
+		clampedWorldPos.z != worldPos.z)
+		return length(clampedWorldPos - worldPos) + 0.2f;
+    
+	float3 uvw = (worldPos - sdfMinbound) / SDF_SCALE;
+	return SDF_TEXTURE.SampleLevel(sampler_LinearClamp, uvw, 0.0f);
+}
+
+[numthreads(8, 8, 1)]
+
+void TileBuild(
+	uint3 id : SV_DispatchThreadID, // tile loc
+	uint3 gid : SV_GroupID,		
+	uint pid : SV_GroupIndex, // tile index
+	uint3 gtid : SV_GroupThreadID) 
+{
+	Frustum frustum = GetTileFrustum(id.xy, TILE_SIZE);
+
+	uint particleIds[MAX_FLUID_PARTICLE_PER_TILE];
+	uint particleCount = 0;
+	
+	float radiusOffset = SMOOTH_RATE + RADIUS_OFFSET; // expand particle radius
+	int remain = PARTICLE_INFO_SIZE;
+	int offset = 0;
+	while (remain > 0)
+	{
+		int current = min(64, remain);
+		remain -= current;
+         
+		FluidParticleInfo particleInfo = PARTICLE_INFO_BUFFER[offset + pid];
+		SHARED_BOUNDING_SPHERE[pid] = float4(particleInfo.position, particleInfo.radius);
+		GroupMemoryBarrierWithGroupSync();
+       
+		for (int i = 0; i < current; i++)
+		{
+			if (particleCount >= MAX_FLUID_PARTICLE_PER_TILE)
+				break;
+        
+			if (FrustumIntersectSphere(frustum, SHARED_BOUNDING_SPHERE[i]) && SHARED_BOUNDING_SPHERE[i].w > radiusOffset) 
+			{
+				particleIds[particleCount++] = offset + i; /// list
+			}
+		}
+		offset += current;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	uint mappingIndex = 0;
+	if (particleCount > 0)
+	{
+		//mappingIndex = MAX_FLUID_PARTICLE_PER_TILE * (id.x * TILE_SIZE.y + id.y);
+		//mappingIndex = MAX_FLUID_PARTICLE_PER_TILE * (id.y * TILE_SIZE.x + id.x);
+		InterlockedAdd(COMPUTE_DATA_BUFFER[0].tileMappingIndex, particleCount, mappingIndex);
+		for (uint i = 0; i < particleCount; i++)
+		{
+			TILE_MAPPING_BUFFER[mappingIndex + i] = particleIds[i];
+		}
+	}
+	RW_TILE_TEXTURE[id.xy] = uint2(mappingIndex, particleCount);
+}
+
+
+
+int3 GetChunkFromWorldPos(float3 worldPos)
+{
+	float3 uvw = (worldPos - SDF_WORLD_POS) / SDF_SCALE + 0.5f;
+	return floor(uvw * CHUNK_SIZE);
+}
+
+uint ChunkMappingIndex(int3 chunk)
+{
+	chunk = clamp(chunk, 0, CHUNK_SIZE - 1);
+	uint mappingIndex = MAX_FLUID_PARTICLE_PER_CHUNK * (chunk.x + chunk.y * CHUNK_SIZE.x + chunk.z * CHUNK_SIZE.x * CHUNK_SIZE.y);
+	return mappingIndex;
+}
+
+
+[numthreads(64, 1, 1)]
+void ChunkBuild(
+	uint3 id : SV_DispatchThreadID,
+	uint3 gid : SV_GroupID,
+	uint pid : SV_GroupIndex,
+	uint3 gtid : SV_GroupThreadID)
+{ 
+	uint particleID = id.x;
+	if (particleID >= PARTICLE_INFO_SIZE)
+		return;
+	FluidParticleInfo particleInfo = PARTICLE_INFO_BUFFER[particleID];
+	if (particleInfo.radius <= 0)
+		return;
+    
+	float radiousOffset = SMOOTH_RATE + RADIUS_OFFSET; // expand particle radious
+	float extent = particleInfo.radius + radiousOffset;
+	BoundingBox box;
+	box.minBound = particleInfo.position - extent;
+	box.maxBound = particleInfo.position + extent;
+    
+	int3 minChunk = GetChunkFromWorldPos(box.minBound);
+	int3 maxChunk = GetChunkFromWorldPos(box.maxBound);
+
+	for (int i = minChunk.x; i <= maxChunk.x; i++)
+	{
+		for (int j = minChunk.y; j <= maxChunk.y; j++)
+		{
+			for (int k = minChunk.z; k <= maxChunk.z; k++)
+			{
+				uint mappingIndex = ChunkMappingIndex(int3(i, j, k));
+				uint size;
+				InterlockedAdd(CHUNK_MAPPING_BUFFER[mappingIndex + 0], 1, size);
+				if (size < MAX_FLUID_PARTICLE_PER_CHUNK - 1)
+					CHUNK_MAPPING_BUFFER[mappingIndex + size + 1] = particleID;
+			}
+		}
+	}
+}
+
+
+
+[numthreads(8, 8, 1)]
+void ChunkCleanup(
+    uint3 id : SV_DispatchThreadID,
+    uint3 gid : SV_GroupID,
+    uint pid : SV_GroupIndex,
+    uint3 gtid : SV_GroupThreadID)
+{
+    uint mappingIndex = ChunkMappingIndex(id);
+    CHUNK_MAPPING_BUFFER[mappingIndex + 0] = 0;
+}
+
+/// sdf build
+[numthreads(8, 8, 1)]
+void SDFBuild(
+    uint3 id : SV_DispatchThreadID,
+    uint3 gid : SV_GroupID,
+    uint pid : SV_GroupIndex, 
+    uint3 gtid : SV_GroupThreadID)
+{
+    float3 worldPos = ((float3(id.xyz) + 0.5f) / SDF_SIZE - 0.5f) * SDF_SCALE + SDF_WORLD_POS;
+    float softDistance = (10.0f / 128); // 
+    softDistance = 0.3;
+    //softDistance = 10;
+ 
+    int3 chunk = GetChunk(id);
+    uint mappingIndex = ChunkMappingIndex(chunk);
+    uint size = min(CHUNK_MAPPING_BUFFER[mappingIndex + 0], MAX_FLUID_PARTICLE_PER_CHUNK - 1);
+
+    for (int j = 0; j < size; j++)
+    {
+        uint particleID = CHUNK_MAPPING_BUFFER[mappingIndex + j + 1];
+        FluidParticleInfo particleInfo = PARTICLE_INFO_BUFFER[particleID];
+        
+        float newDistance = length(worldPos.xyz - particleInfo.position) - particleInfo.radius;
+        
+        softDistance = smin(softDistance, newDistance, SMOOTH_RATE);
+    }
+    RW_SDF_TEXTURE[id.xyz] = softDistance;
+}
